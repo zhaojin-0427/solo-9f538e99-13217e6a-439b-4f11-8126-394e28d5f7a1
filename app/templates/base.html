@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}批次漂移核查{% endblock %}</title>
+  <title>{% block title %}仪器电压读数比对{% endblock %}</title>
   <style>
     :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --err:#cf222e; }
     * { box-sizing: border-box; }
@@ -29,15 +29,16 @@
     .tag.published { background: #dafbe1; color: var(--ok); }
     .tag.draft { background: #fff8c5; color: #9a6700; }
     .muted { color: #656d76; font-size: 13px; }
-    .high { color: var(--err); } .low { color: #9a6700; }
+    .warn { color: var(--err); font-weight: 600; }
+    .big { font-size: 18px; font-weight: 600; }
     code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
   </style>
 </head>
 <body>
 <header>
-  <strong>实验室批次漂移核查</strong>
-  <a href="{{ url_for('main.index') }}">批次与核查</a>
-  <a href="{{ url_for('main.segments_page') }}">异常段查询</a>
+  <strong>仪器电压读数比对</strong>
+  <a href="{{ url_for('main.index') }}">批次与发布</a>
+  <a href="{{ url_for('main.compare_page') }}">仪器比对</a>
 </header>
 <main>
   {% with messages = get_flashed_messages(with_categories=true) %}

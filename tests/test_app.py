@@ -1,7 +1,14 @@
-"""端到端自测：基线污染、断段规则、失败提交、版本化重算、冲突拒绝。
+"""端到端自测：仪器电压读数比对。
 
-直接使用 Flask test client 走完整 HTTP 栈；每个用例独立临时数据库。
-运行：PYTHONPATH=/tmp/pylibs:. python3 -I -m unittest -v tests.test_app
+覆盖：
+- 共测样品匹配、共测数/超差数/最大相差样本（含并列取最小序号）；
+- 无共测样品直接提示；容差边界（abs_diff == tolerance 不算超差）；
+- 容差查询只读统计索引（不访问 reading 表）；
+- 草稿不可比对；发布失败回滚、版本保持草稿、可重试；
+- 更正后新版统计变化，旧版统计仍可查；
+- 约束：整数微伏、|值|<=1e6、每批 10 万条、6 台仪器；同键异值整份拒绝；
+- 网页渲染与下拉数据。
+运行：python -I -m unittest -v tests.test_app
 """
 from __future__ import annotations
 
@@ -11,14 +18,17 @@ import tempfile
 import unittest
 
 from app import create_app
+from app.db import MAX_DEVICES_PER_BATCH, MAX_READINGS_PER_BATCH
+
+HEADER = "batch,device,sample_seq,microvolt"
 
 
-def csv_text(rows: list[tuple], header="batch,device,sample_seq,utc_ts,metric_value"):
+def csv_text(rows: list[tuple], header: str = HEADER) -> str:
     body = "\n".join(",".join(str(c) for c in r) for r in rows)
     return header + "\n" + body + "\n"
 
 
-class DriftTestBase(unittest.TestCase):
+class VoltTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp.name, "test.db")
@@ -28,487 +38,460 @@ class DriftTestBase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def upload(self, rows, simulate_fail=False):
+    def upload(self, rows, simulate_fail=False, raw_text=None):
         data = {
-            "file": (io.BytesIO(csv_text(rows).encode()), "m.csv"),
+            "file": (
+                io.BytesIO((raw_text or csv_text(rows)).encode()),
+                "m.csv",
+            ),
         }
         url = "/api/uploads" + ("?simulate_fail=1" if simulate_fail else "")
         return self.client.post(
             url, data=data, content_type="multipart/form-data"
         )
 
-    def publish(self, batch):
-        return self.client.post(f"/api/batches/{batch}/publish")
+    def publish(self, batch, version=None, simulate_fail=False):
+        url = f"/api/batches/{batch}/publish"
+        params = []
+        if version is not None:
+            params.append(f"version={version}")
+        if simulate_fail:
+            params.append("simulate_fail=1")
+        if params:
+            url += "?" + "&".join(params)
+        return self.client.post(url)
 
-    def check(self, baseline, target, multiplier=3.0):
-        resp = self.client.post(
-            "/api/checks",
-            json={
-                "baseline_batch": baseline,
-                "target_batch": target,
-                "mad_multiplier": multiplier,
+    def compare(self, batch, version, dx, dy, tol):
+        return self.client.get(
+            "/api/compare",
+            query_string={
+                "batch_name": batch,
+                "version": version,
+                "device_x": dx,
+                "device_y": dy,
+                "tolerance": tol,
             },
         )
-        self.assertEqual(resp.status_code, 201, resp.data)
-        return resp.get_json()
-
-    def segments(self, **params):
-        resp = self.client.get("/api/segments", query_string=params)
-        self.assertEqual(resp.status_code, 200)
-        return resp.get_json()["segments"]
 
 
-class TestBaselinePollution(DriftTestBase):
-    """核查只允许使用已发布批次；草稿与后续上传都不能污染基线结论。"""
+# --------------------------------------------------------------------------- #
+# 比对统计正确性
+# --------------------------------------------------------------------------- #
 
-    BASE = [
-        ("B1", "D1", i, f"2026-11-01T00:{i:02d}:00Z", 10.0 + (i % 2) * 0.1)
-        for i in range(1, 9)
+
+class TestComparisonStats(VoltTestBase):
+    # D1/D2 共测样本 1..5；D3 只测样本 7、8（与 D1/D2 无共测）
+    ROWS = [
+        ("B1", "D1", 1, 100),
+        ("B1", "D1", 2, 100),
+        ("B1", "D1", 3, 100),
+        ("B1", "D1", 4, 100),
+        ("B1", "D1", 5, 100),
+        ("B1", "D2", 1, 100),   # diff 0
+        ("B1", "D2", 2, 105),   # diff 5
+        ("B1", "D2", 3, 110),   # diff 10
+        ("B1", "D2", 4, 110),   # diff 10（与样本3并列最大）
+        ("B1", "D2", 5, 90),    # diff 10（第三个并列）
+        ("B1", "D2", 6, 50),    # D1 未测 → 不参与
+        ("B1", "D3", 7, 10),
+        ("B1", "D3", 8, 20),
     ]
 
-    def test_draft_cannot_be_used_and_publish_immutable(self):
-        self.upload(self.BASE)
-        # 未发布 → 核查必须 404
-        resp = self.client.post(
-            "/api/checks",
-            json={"baseline_batch": "B1", "target_batch": "B1",
-                  "mad_multiplier": 3},
-        )
-        self.assertEqual(resp.status_code, 404)
-
-        self.assertEqual(self.publish("B1").status_code, 200)
-        # 重复发布被拒
-        self.assertEqual(self.publish("B1").status_code, 409)
-
-    def test_new_upload_does_not_change_published_baseline(self):
-        # 基线：围绕 10.0 小幅波动
-        self.upload(self.BASE)
-        self.publish("B1")
-        # 待检：3 个连续高值，偏离 10 超过 3*MAD（MAD=0.1 → 带 9.7~10.3）
-        target = [
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 10.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 11.5),
-            ("B2", "D1", 3, "2026-11-08T00:03:00Z", 11.6),
-            ("B2", "D1", 4, "2026-11-08T00:04:00Z", 11.7),
-        ]
-        self.upload(target)
-        self.publish("B2")
-        result = self.check("B1", "B2")
-        check_id = result["check_id"]
-
-        # 之后向基线批次上传“污染版”（中位数被推到 20），仅草稿
-        polluted = [
-            ("B1", "D1", i, f"2026-11-09T00:{i:02d}:00Z", 20.0)
-            for i in range(1, 9)
-        ]
-        resp = self.upload(polluted)
-        self.assertEqual(resp.status_code, 201)
-        self.assertEqual(resp.get_json()["created"][0]["version"], 2)
-
-        # 历史核查读取的仍是 v1 版号与原结论
-        detail = self.client.get(f"/api/checks/{check_id}").get_json()
-        self.assertEqual(detail["check"]["baseline_version"], 1)
-        med = next(d for d in detail["devices"] if d["device_id"] == "D1")
-        # 8 个点 10.0/10.1 各四个 → 中位数 10.05，MAD 0.05
-        self.assertAlmostEqual(med["baseline_median"], 10.05, places=6)
-        self.assertAlmostEqual(med["baseline_mad"], 0.05, places=6)
-        self.assertEqual(med["segment_count"], 1)
-        seg = detail["segments"][0]
-        self.assertEqual((seg["start_seq"], seg["end_seq"]), (2, 4))
-        self.assertEqual(seg["direction"], "high")
-
-        # 重算：v2 仍是草稿，系统只认最新“已发布”版 v1，
-        # 因此受影响设备为空、基线版号仍为 1，旧结论不被污染
-        resp = self.client.post(f"/api/checks/{check_id}/rerun")
-        self.assertEqual(resp.status_code, 201)
-        rerun = resp.get_json()
-        self.assertEqual(rerun["affected_devices"], [])
-        new_detail = self.client.get(
-            f"/api/checks/{rerun['check_id']}"
-        ).get_json()
-        self.assertEqual(new_detail["check"]["baseline_version"], 1)
-        self.assertEqual(
-            new_detail["devices"][0]["baseline_median"], 10.05
-        )
-        # 发布污染版后再重算，才会切换到 v2 并改变设备结论
-        self.publish("B1")
-        resp2 = self.client.post(f"/api/checks/{check_id}/rerun")
-        self.assertEqual(resp2.status_code, 201)
-        polluted_detail = self.client.get(
-            f"/api/checks/{resp2.get_json()['check_id']}"
-        ).get_json()
-        self.assertEqual(polluted_detail["check"]["baseline_version"], 2)
-        self.assertEqual(
-            polluted_detail["devices"][0]["baseline_median"], 20.0
-        )
-        # 最初的核查结论仍然原样可查
-        old_again = self.client.get(f"/api/checks/{check_id}").get_json()
-        self.assertEqual(old_again["check"]["baseline_version"], 1)
-        self.assertEqual(len(old_again["segments"]), 1)
-
-
-class TestSegmentBreaking(DriftTestBase):
-    """断段：回到带内、缺测（序号不连续）、UTC 不递增、设备切换。"""
-
     def setUp(self):
         super().setUp()
-        # MAD=0.1，3 倍带为 [9.7, 10.3]
-        baseline = [
-            ("B1", "D1", i, f"2026-11-01T00:{i:02d}:00Z",
-             10.0 + (i % 2) * 0.1)
-            for i in range(1, 9)
-        ] + [
-            ("B1", "D2", i, f"2026-11-01T00:{i:02d}:00Z",
-             5.0 + (i % 2) * 0.1)
-            for i in range(1, 9)
-        ]
-        self.upload(baseline)
-        self.publish("B1")
+        self.assertEqual(self.upload(self.ROWS).status_code, 201)
+        self.assertEqual(self.publish("B1").status_code, 200)
 
-    def _publish_target(self, rows):
+    def test_common_count_and_histogram_tolerance(self):
+        # 共测 5 个（样本 1..5）
+        r = self.compare("B1", 1, "D1", "D2", 0).get_json()
+        self.assertEqual(r["common_count"], 5)
+        self.assertEqual(r["over_tolerance_count"], 4)  # diff 5,10,10,10
+        self.assertEqual(r["max_abs_diff"], 10)
+        # 最大差并列 → 取最小样本序号 3
+        self.assertEqual(r["max_diff_seq"], 3)
+        self.assertTrue(r["has_common"])
+
+        # 容差 5：严格“超过”才算，diff==5 不计 → 3 个
+        r5 = self.compare("B1", 1, "D1", "D2", 5).get_json()
+        self.assertEqual(r5["over_tolerance_count"], 3)
+        # 容差 10：没有超过 10 的
+        r10 = self.compare("B1", 1, "D1", "D2", 10).get_json()
+        self.assertEqual(r10["over_tolerance_count"], 0)
+        # 容差足够大
+        r_big = self.compare("B1", 1, "D2", "D1", 1_000_000).get_json()
+        self.assertEqual(r_big["over_tolerance_count"], 0)
+        # 仪器顺序互换结果一致（规范化），且仍是同一对
+        self.assertEqual(r_big["device_a"], "D1")
+        self.assertEqual(r_big["device_b"], "D2")
+
+    def test_no_common_samples_message(self):
+        r = self.compare("B1", 1, "D1", "D3", 0).get_json()
+        self.assertEqual(r["common_count"], 0)
+        self.assertFalse(r["has_common"])
+        self.assertEqual(r["over_tolerance_count"], 0)
+        self.assertIsNone(r["max_diff_seq"])
+        self.assertIn("没有共测样品", r["message"])
+        # 网页端同样渲染提示
+        page = self.client.get(
+            "/compare",
+            query_string={
+                "batch_name": "B1", "version": 1,
+                "device_x": "D1", "device_y": "D3", "tolerance": 0,
+            },
+        )
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("没有共测样品", page.get_data(as_text=True))
+
+    def test_negative_abs_diff_is_absolute(self):
+        rows = [
+            ("B2", "A", 1, -500),
+            ("B2", "A", 2, 500),
+            ("B2", "B", 1, -480),   # |diff|=20
+            ("B2", "B", 2, 470),    # |diff|=30
+        ]
         self.upload(rows)
         self.publish("B2")
+        r = self.compare("B2", 1, "A", "B", 25).get_json()
+        self.assertEqual(r["common_count"], 2)
+        self.assertEqual(r["over_tolerance_count"], 1)
+        self.assertEqual(r["max_abs_diff"], 30)
+        self.assertEqual(r["max_diff_seq"], 2)
 
-    def test_return_to_band_breaks_and_min_three_samples(self):
-        rows = [
-            # 高值只有 2 个 → 不成段
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 11.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 11.1),
-            ("B2", "D1", 3, "2026-11-08T00:03:00Z", 10.0),  # 回带内
-            # 连续 3 个高值 → 成段 4-6
-            ("B2", "D1", 4, "2026-11-08T00:04:00Z", 11.2),
-            ("B2", "D1", 5, "2026-11-08T00:05:00Z", 11.3),
-            ("B2", "D1", 6, "2026-11-08T00:06:00Z", 11.4),
-            ("B2", "D1", 7, "2026-11-08T00:07:00Z", 10.1),  # 断开
-            # 再 3 个低值 → 第二段 8-10
-            ("B2", "D1", 8, "2026-11-08T00:08:00Z", 8.0),
-            ("B2", "D1", 9, "2026-11-08T00:09:00Z", 7.9),
-            ("B2", "D1", 10, "2026-11-08T00:10:00Z", 7.8),
-        ]
-        self._publish_target(rows)
-        result = self.check("B1", "B2")
-        detail = self.client.get(
-            f"/api/checks/{result['check_id']}"
-        ).get_json()
-        segs = detail["segments"]
-        self.assertEqual(len(segs), 2)
-        self.assertEqual(
-            [(s["start_seq"], s["end_seq"], s["direction"]) for s in segs],
-            [(4, 6, "high"), (8, 10, "low")],
+    def test_tolerance_query_does_not_touch_reading_table(self):
+        """核心约束：换容差只查统计索引，SQL 层面不出现 reading 表。"""
+        with self.app.app_context():
+            from app.db import get_db
+            from app import services as svc
+
+            conn = get_db()
+            plans = []
+            for tol in (0, 5, 10, 999):
+                # 用 EXPLAIN QUERY PLAN 抓取该容差查询实际访问的表
+                pair = conn.execute(
+                    "SELECT id FROM pair_stat WHERE batch_name=? AND version=? "
+                    "AND device_a=? AND device_b=?",
+                    ("B1", 1, "D1", "D2"),
+                ).fetchone()
+                plan = conn.execute(
+                    "EXPLAIN QUERY PLAN SELECT COALESCE(SUM(freq),0) "
+                    "FROM diff_histogram WHERE pair_stat_id=? AND abs_diff>?",
+                    (pair["id"], tol),
+                ).fetchall()
+                plans.extend([p["detail"] for p in plan])
+
+            joined = " ".join(plans)
+            self.assertIn("diff_histogram", joined)
+            self.assertNotIn("reading", joined.lower())
+
+            # 再用 trace 兜底：执行服务层查询期间记录所有被读的表
+            accessed: set[str] = set()
+
+            def tracer(_conn, _cur, statement):
+                low = statement.lower()
+                if low.startswith("select") and "reading" in low:
+                    accessed.add("reading")
+
+            conn.set_trace_callback(tracer)
+            for tol in range(0, 12):
+                svc.compare_devices("B1", 1, "D1", "D2", tol)
+            conn.set_trace_callback(None)
+            self.assertNotIn("reading", accessed)
+
+    def test_same_device_rejected(self):
+        resp = self.compare("B1", 1, "D1", "D1", 0)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_unknown_pair_404(self):
+        resp = self.compare("B1", 1, "D1", "D9", 0)
+        self.assertEqual(resp.status_code, 404)
+
+    def test_negative_tolerance_rejected(self):
+        resp = self.client.get(
+            "/api/compare",
+            query_string={
+                "batch_name": "B1", "version": 1,
+                "device_x": "D1", "device_y": "D2", "tolerance": -1,
+            },
         )
-        self.assertTrue(all(s["sample_count"] >= 3 for s in segs))
-
-    def test_missing_sample_breaks_run(self):
-        rows = [
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 11.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 11.1),
-            # 序号 3 缺测
-            ("B2", "D1", 4, "2026-11-08T00:04:00Z", 11.2),
-            ("B2", "D1", 5, "2026-11-08T00:05:00Z", 11.3),
-            ("B2", "D1", 6, "2026-11-08T00:06:00Z", 11.4),
-        ]
-        self._publish_target(rows)
-        result = self.check("B1", "B2")
-        detail = self.client.get(
-            f"/api/checks/{result['check_id']}"
-        ).get_json()
-        # 前 2 个不成段；4-6 是缺测后的新连续段，仍应单独成段
-        segs = detail["segments"]
-        self.assertEqual(len(segs), 1)
-        self.assertEqual((segs[0]["start_seq"], segs[0]["end_seq"]), (4, 6))
-
-    def test_utc_non_increasing_breaks_run(self):
-        rows = [
-            ("B2", "D1", 1, "2026-11-08T00:03:00Z", 11.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 11.1),  # 时刻倒退
-            ("B2", "D1", 3, "2026-11-08T00:03:00Z", 11.2),  # 时刻持平
-            ("B2", "D1", 4, "2026-11-08T00:04:00Z", 11.3),
-            ("B2", "D1", 5, "2026-11-08T00:05:00Z", 11.4),
-        ]
-        self._publish_target(rows)
-        result = self.check("B1", "B2")
-        segs = self.client.get(
-            f"/api/checks/{result['check_id']}"
-        ).get_json()["segments"]
-        # 断两次后只剩 3-5 连续（3 与 2 时刻相同而断开，3->4->5 严格递增）
-        self.assertEqual(len(segs), 1)
-        self.assertEqual((segs[0]["start_seq"], segs[0]["end_seq"]), (3, 5))
-
-    def test_device_switch_separates_runs(self):
-        rows = [
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 11.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 11.1),
-            ("B2", "D2", 1, "2026-11-08T00:01:00Z", 6.5),
-            ("B2", "D2", 2, "2026-11-08T00:02:00Z", 6.6),
-            ("B2", "D2", 3, "2026-11-08T00:03:00Z", 6.7),
-        ]
-        self._publish_target(rows)
-        result = self.check("B1", "B2")
-        detail = self.client.get(
-            f"/api/checks/{result['check_id']}"
-        ).get_json()
-        # D1 只有 2 点不成段；D2 三点成段，设备互不串联
-        d1 = next(d for d in detail["devices"] if d["device_id"] == "D1")
-        d2 = next(d for d in detail["devices"] if d["device_id"] == "D2")
-        self.assertEqual(d1["segment_count"], 0)
-        self.assertEqual(d2["segment_count"], 1)
-        self.assertEqual(detail["segments"][0]["device_id"], "D2")
-
-    def test_zero_mad_baseline(self):
-        # 常量基线：MAD=0，阈值带退化为中位数点
-        baseline = [
-            ("B3", "D9", i, f"2026-11-01T00:{i:02d}:00Z", 7.0)
-            for i in range(1, 7)
-        ]
-        target = [
-            ("B4", "D9", 1, "2026-11-08T00:01:00Z", 7.0),
-            ("B4", "D9", 2, "2026-11-08T00:02:00Z", 7.01),
-            ("B4", "D9", 3, "2026-11-08T00:03:00Z", 7.02),
-            ("B4", "D9", 4, "2026-11-08T00:04:00Z", 7.03),
-        ]
-        self.upload(baseline)
-        self.publish("B3")
-        self.upload(target)
-        self.publish("B4")
-        result = self.check("B3", "B4")
-        detail = self.client.get(
-            f"/api/checks/{result['check_id']}"
-        ).get_json()
-        d9 = next(d for d in detail["devices"] if d["device_id"] == "D9")
-        self.assertEqual(d9["baseline_mad"], 0.0)
-        self.assertEqual(d9["segment_count"], 1)
+        self.assertEqual(resp.status_code, 400)
 
 
-class TestFailedCommitAndConflicts(DriftTestBase):
-    def setUp(self):
-        super().setUp()
-        self.rows = [
-            ("B1", "D1", i, f"2026-11-01T00:{i:02d}:00Z", 10.0 + i * 0.01)
-            for i in range(1, 6)
-        ]
-        self.upload(self.rows)
+# --------------------------------------------------------------------------- #
+# 草稿 / 发布 / 版本固化
+# --------------------------------------------------------------------------- #
+
+
+class TestPublishingAndVersioning(VoltTestBase):
+    def test_draft_cannot_be_compared(self):
+        self.upload([("B1", "D1", 1, 100), ("B1", "D2", 1, 101)])
+        resp = self.compare("B1", 1, "D1", "D2", 0)
+        self.assertEqual(resp.status_code, 404)
+        # 发布后可查
+        self.assertEqual(self.publish("B1").status_code, 200)
+        self.assertEqual(self.compare("B1", 1, "D1", "D2", 0).status_code, 200)
+
+    def test_published_immutable_and_no_duplicate_publish(self):
+        self.upload([("B1", "D1", 1, 100)])
         self.publish("B1")
+        self.assertEqual(self.publish("B1").status_code, 409)
 
-    def test_simulated_commit_failure_changes_nothing(self):
-        before_batches = self.client.get("/api/batches").get_json()
-        before_count = len(before_batches["batches"])
+    def test_correction_keeps_old_version_stats(self):
+        v1 = [
+            ("B1", "D1", 1, 100), ("B1", "D1", 2, 100),
+            ("B1", "D2", 1, 110), ("B1", "D2", 2, 120),
+        ]
+        self.upload(v1)
+        self.publish("B1")
+        old = self.compare("B1", 1, "D1", "D2", 5).get_json()
+        self.assertEqual(old["common_count"], 2)
+        self.assertEqual(old["over_tolerance_count"], 2)
+        self.assertEqual(old["max_abs_diff"], 20)
+        self.assertEqual(old["max_diff_seq"], 2)
 
+        # 更正：v2 把 D2 拉齐，差值变小
+        v2 = [
+            ("B1", "D1", 1, 100), ("B1", "D1", 2, 100),
+            ("B1", "D2", 1, 101), ("B1", "D2", 2, 102),
+        ]
+        resp = self.upload(v2)
+        self.assertEqual(resp.get_json()["created"][0]["version"], 2)
+        # v2 还是草稿 → 比对 v2 被拒，v1 结论不变
+        self.assertEqual(self.compare("B1", 2, "D1", "D2", 5).status_code, 404)
+        old_again = self.compare("B1", 1, "D1", "D2", 5).get_json()
+        self.assertEqual(old_again["max_abs_diff"], 20)
+
+        self.publish("B1", version=2)
+        new = self.compare("B1", 2, "D1", "D2", 5).get_json()
+        self.assertEqual(new["over_tolerance_count"], 0)
+        self.assertEqual(new["max_abs_diff"], 2)
+        # 旧版统计仍可查
+        old_still = self.compare("B1", 1, "D1", "D2", 5).get_json()
+        self.assertEqual(old_still["version"], 1)
+        self.assertEqual(old_still["max_abs_diff"], 20)
+
+    def test_publish_failure_rolls_back_and_draft_retryable(self):
+        rows = [("B1", "D1", 1, 100), ("B1", "D2", 1, 105)]
+        self.upload(rows)
+        # 模拟发布失败：状态必须仍是 draft，且没有任何统计残留
+        resp = self.publish("B1", simulate_fail=True)
+        self.assertEqual(resp.status_code, 500)
+        batches = self.client.get("/api/batches").get_json()["batches"]
+        self.assertEqual(batches[0]["status"], "draft")
+
+        with self.app.app_context():
+            from app.db import get_db
+            conn = get_db()
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) AS n FROM pair_stat").fetchone()["n"],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) AS n FROM diff_histogram"
+                ).fetchone()["n"],
+                0,
+            )
+
+        # 草稿可重试：正常发布成功
+        self.assertEqual(self.publish("B1").status_code, 200)
+        r = self.compare("B1", 1, "D1", "D2", 0).get_json()
+        self.assertEqual(r["common_count"], 1)
+        self.assertEqual(r["over_tolerance_count"], 1)
+
+    def test_upload_failure_creates_no_version(self):
+        before = len(self.client.get("/api/batches").get_json()["batches"])
         resp = self.upload(
-            [("B1", "D1", 9, "2026-11-09T00:09:00Z", 99.0)],
-            simulate_fail=True,
+            [("B1", "D1", 1, 100)], simulate_fail=True
         )
         self.assertEqual(resp.status_code, 500)
+        after = len(self.client.get("/api/batches").get_json()["batches"])
+        self.assertEqual(before, after)
 
-        after_batches = self.client.get("/api/batches").get_json()
-        self.assertEqual(len(after_batches["batches"]), before_count)
-        # 当前已发布核查能力不受影响：仍可正常核查且无 99 这个值
-        target = [
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 10.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 10.0),
-            ("B2", "D1", 3, "2026-11-08T00:03:00Z", 10.0),
-        ]
-        self.upload(target)
-        self.publish("B2")
-        result = self.check("B1", "B2")
-        detail = self.client.get(
-            f"/api/checks/{result['check_id']}"
-        ).get_json()
-        med = detail["devices"][0]["baseline_median"]
-        self.assertNotAlmostEqual(med, 99.0)
 
-    def test_same_key_conflicting_value_rejected_entirely(self):
-        before = self.client.get("/api/batches").get_json()["batches"]
-        conflicting = [
-            ("B1", "D1", 1, "2026-11-09T00:01:00Z", 50.0),
-            ("B1", "D1", 1, "2026-11-09T00:02:00Z", 51.0),  # 同键异值
+# --------------------------------------------------------------------------- #
+# 输入校验与约束
+# --------------------------------------------------------------------------- #
+
+
+class TestValidation(VoltTestBase):
+    def test_non_integer_reading_rejected(self):
+        resp = self.upload(
+            [], raw_text=HEADER + "\nB1,D1,1,12.5\n"
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("整数", resp.get_json()["error"])
+
+    def test_out_of_range_reading_rejected(self):
+        resp = self.upload([("B1", "D1", 1, 1_000_001)])
+        self.assertEqual(resp.status_code, 400)
+        resp2 = self.upload([("B1", "D1", 1, -1_000_001)])
+        self.assertEqual(resp2.status_code, 400)
+        # 边界值合法
+        ok = self.upload(
+            [("B1", "D1", 1, 1_000_000), ("B1", "D1", 2, -1_000_000)]
+        )
+        self.assertEqual(ok.status_code, 201)
+
+    def test_conflicting_same_key_rejects_entire_file(self):
+        rows = [
+            ("B1", "D1", 1, 100),
+            ("B1", "D1", 1, 101),  # 同键异值
+            ("B1", "D2", 1, 50),
         ]
-        resp = self.upload(conflicting)
+        resp = self.upload(rows)
         self.assertEqual(resp.status_code, 409)
-        after = self.client.get("/api/batches").get_json()["batches"]
-        self.assertEqual(len(before), len(after))  # 没有产生新版本
+        self.assertEqual(
+            self.client.get("/api/batches").get_json()["batches"], []
+        )
 
-    def test_exact_duplicate_rows_deduped(self):
-        dup = [
-            ("B5", "D1", 1, "2026-11-09T00:01:00Z", 1.0),
-            ("B5", "D1", 1, "2026-11-09T00:01:00Z", 1.0),  # 完全重复
-            ("B5", "D1", 2, "2026-11-09T00:02:00Z", 1.1),
+    def test_exact_duplicates_deduped(self):
+        rows = [
+            ("B1", "D1", 1, 100),
+            ("B1", "D1", 1, 100),  # 完全重复
+            ("B1", "D1", 2, 101),
         ]
-        resp = self.upload(dup)
+        resp = self.upload(rows)
         self.assertEqual(resp.status_code, 201)
         created = resp.get_json()["created"][0]
         self.assertEqual(created["row_count"], 2)
         self.assertEqual(created["duplicate_rows_skipped"], 1)
 
-    def test_duplicate_count_is_per_batch_in_multi_batch_file(self):
-        rows = [
-            ("B6", "D1", 1, "2026-11-09T00:01:00Z", 1.0),
-            ("B6", "D1", 1, "2026-11-09T00:01:00Z", 1.0),  # B6 重复 1 行
-            ("B7", "D1", 1, "2026-11-09T00:01:00Z", 2.0),
-            ("B7", "D1", 2, "2026-11-09T00:02:00Z", 2.1),
-            ("B7", "D1", 2, "2026-11-09T00:02:00Z", 2.1),  # B7 重复 1 行
-            ("B7", "D1", 3, "2026-11-09T00:03:00Z", 2.2),
-        ]
-        resp = self.upload(rows)
-        self.assertEqual(resp.status_code, 201)
-        stats = {c["batch_name"]: c for c in resp.get_json()["created"]}
-        self.assertEqual(stats["B6"]["row_count"], 1)
-        self.assertEqual(stats["B6"]["duplicate_rows_skipped"], 1)
-        self.assertEqual(stats["B7"]["row_count"], 3)
-        self.assertEqual(stats["B7"]["duplicate_rows_skipped"], 1)
-
     def test_missing_column_rejected(self):
-        resp = self.client.post(
-            "/api/uploads",
-            data={"file": (io.BytesIO(b"batch,device,sample_seq,utc_ts\n"
-                                      b"X,D,1,2026-11-01T00:00:00Z\n"),
-                           "bad.csv")},
-            content_type="multipart/form-data",
+        resp = self.upload(
+            [], raw_text="batch,device,sample_seq\nB1,D1,1\n"
         )
         self.assertEqual(resp.status_code, 400)
 
-
-class TestVersioningAndRerun(DriftTestBase):
-    def _baseline(self, value=10.0):
-        return [
-            ("B1", "D1", i, f"2026-11-01T00:{i:02d}:00Z",
-             value + (i % 2) * 0.1)
-            for i in range(1, 9)
-        ]
-
-    def test_rerun_uses_new_versions_and_keeps_old_conclusion(self):
-        self.upload(self._baseline())
-        self.publish("B1")
-        target = [
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 10.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 11.5),
-            ("B2", "D1", 3, "2026-11-08T00:03:00Z", 11.6),
-            ("B2", "D1", 4, "2026-11-08T00:04:00Z", 11.7),
-        ]
-        self.upload(target)
-        self.publish("B2")
-        first = self.check("B1", "B2")
-        old_id = first["check_id"]
-        old_detail = self.client.get(f"/api/checks/{old_id}").get_json()
-        self.assertEqual(old_detail["check"]["target_version"], 1)
-        self.assertEqual(len(old_detail["segments"]), 1)
-
-        # 更正待检：v2 中异常点被改回正常值
-        corrected = [
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 10.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 10.05),
-            ("B2", "D1", 3, "2026-11-08T00:03:00Z", 10.06),
-            ("B2", "D1", 4, "2026-11-08T00:04:00Z", 10.07),
-        ]
-        self.upload(corrected)
-        self.publish("B2")
-
-        rerun = self.client.post(f"/api/checks/{old_id}/rerun").get_json()
-        new_id = rerun["check_id"]
-        self.assertNotEqual(new_id, old_id)
-        self.assertEqual(rerun["supersedes"], old_id)
-        self.assertIn("D1", rerun["affected_devices"])
-
-        new_detail = self.client.get(f"/api/checks/{new_id}").get_json()
-        self.assertEqual(new_detail["check"]["target_version"], 2)
-        self.assertEqual(len(new_detail["segments"]), 0)
-
-        # 旧结论原样可查
-        old_again = self.client.get(f"/api/checks/{old_id}").get_json()
-        self.assertEqual(old_again["check"]["target_version"], 1)
-        self.assertEqual(len(old_again["segments"]), 1)
-
-        # 无数据变化再重算：受影响设备为空，版号不变
-        third = self.client.post(f"/api/checks/{new_id}/rerun").get_json()
-        self.assertEqual(third["affected_devices"], [])
-
-    def test_rerun_with_baseline_correction(self):
-        self.upload(self._baseline(10.0))
-        self.publish("B1")
-        target = [
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 10.0),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 11.5),
-            ("B2", "D1", 3, "2026-11-08T00:03:00Z", 11.6),
-            ("B2", "D1", 4, "2026-11-08T00:04:00Z", 11.7),
-        ]
-        self.upload(target)
-        self.publish("B2")
-        first = self.check("B1", "B2")["check_id"]
-
-        # 基线更正：波动变大，MAD 变大，阈值带变宽
-        new_base = [
-            ("B1", "D1", i, f"2026-11-01T00:{i:02d}:00Z",
-             10.0 + (i % 2) * 0.8)
-            for i in range(1, 9)
-        ]
-        self.upload(new_base)
-        self.publish("B1")
-        rerun = self.client.post(f"/api/checks/{first}/rerun").get_json()
-        detail = self.client.get(
-            f"/api/checks/{rerun['check_id']}"
-        ).get_json()
-        self.assertEqual(detail["check"]["baseline_version"], 2)
-        d1 = detail["devices"][0]
-        self.assertGreater(d1["baseline_mad"], 0.1)
-        # 宽阈值带下 11.5~11.7 不再构成偏离
-        self.assertEqual(d1["segment_count"], 0)
-
-    def test_segment_query_filters(self):
-        # D1、D2 都给基线数据，避免“基线无该设备”被跳过
-        baseline = [
-            ("B1", dev, i, f"2026-11-01T00:{i:02d}:00Z",
-             10.0 + (i % 2) * 0.1)
-            for dev in ("D1", "D2") for i in range(1, 9)
-        ]
-        self.upload(baseline)
-        self.publish("B1")
-        target = [
-            ("B2", "D1", 1, "2026-11-08T00:01:00Z", 11.5),
-            ("B2", "D1", 2, "2026-11-08T00:02:00Z", 11.6),
-            ("B2", "D1", 3, "2026-11-08T00:03:00Z", 11.7),
-            ("B2", "D2", 1, "2026-11-08T00:01:00Z", 8.0),
-            ("B2", "D2", 2, "2026-11-08T00:02:00Z", 7.9),
-            ("B2", "D2", 3, "2026-11-08T00:03:00Z", 7.8),
-            ("B2", "D2", 4, "2026-11-08T00:04:00Z", 7.7),
-        ]
-        self.upload(target)
-        self.publish("B2")
-        self.check("B1", "B2")
-
-        self.assertEqual(len(self.segments()), 2)
-        self.assertEqual(len(self.segments(device_id="D1")), 1)
-        self.assertEqual(len(self.segments(direction="low")), 1)
-        self.assertEqual(
-            len(self.segments(min_samples=4)), 1
-        )
-        self.assertEqual(
-            self.segments(batch_name="B2")[0]["target_batch"], "B2"
-        )
-
-
-class TestWebUI(DriftTestBase):
-    def test_pages_render(self):
-        self.assertEqual(self.client.get("/").status_code, 200)
-        self.assertEqual(self.client.get("/segments").status_code, 200)
+    def test_too_many_devices_rejected(self):
         rows = [
-            ("B1", "D1", i, f"2026-11-01T00:{i:02d}:00Z", 10.0)
-            for i in range(1, 5)
+            ("B1", f"D{i}", 1, 100)
+            for i in range(MAX_DEVICES_PER_BATCH + 1)
+        ]
+        resp = self.upload(rows)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("最多 6 台", resp.get_json()["error"])
+
+    def test_too_many_readings_rejected(self):
+        # 100001 条，分散在 2 台仪器（避免触发仪器数限制）
+        rows = []
+        for i in range(MAX_READINGS_PER_BATCH + 1):
+            rows.append(("B1", "D1" if i % 2 else "D2", i, 0))
+        resp = self.upload(rows)
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("100000", resp.get_json()["error"])
+
+    def test_limit_boundary_accepted(self):
+        # 恰好 100000 条、6 台仪器应通过
+        rows = []
+        for i in range(MAX_READINGS_PER_BATCH):
+            rows.append(("B1", f"D{i % 6}", i, 0))
+        resp = self.upload(rows)
+        self.assertEqual(resp.status_code, 201)
+        created = resp.get_json()["created"][0]
+        self.assertEqual(created["row_count"], MAX_READINGS_PER_BATCH)
+        self.assertEqual(created["device_count"], 6)
+
+    def test_chinese_header_supported(self):
+        text = "批次,仪器,样本序号,电压读数\nB1,D1,1,-250\nB1,D2,1,-240\n"
+        resp = self.upload([], raw_text=text)
+        self.assertEqual(resp.status_code, 201)
+        self.publish("B1")
+        r = self.compare("B1", 1, "D1", "D2", 5).get_json()
+        self.assertEqual(r["over_tolerance_count"], 1)
+        self.assertEqual(r["max_abs_diff"], 10)
+
+    def test_multi_batch_file(self):
+        rows = [
+            ("B1", "D1", 1, 100), ("B1", "D2", 1, 101),
+            ("B2", "D1", 1, 200), ("B2", "D2", 1, 203),
+        ]
+        resp = self.upload(rows)
+        self.assertEqual(resp.status_code, 201)
+        names = {c["batch_name"] for c in resp.get_json()["created"]}
+        self.assertEqual(names, {"B1", "B2"})
+        self.publish("B1")
+        self.publish("B2")
+        r1 = self.compare("B1", 1, "D1", "D2", 0).get_json()
+        r2 = self.compare("B2", 1, "D1", "D2", 2).get_json()
+        self.assertEqual(r1["max_abs_diff"], 1)
+        self.assertEqual(r2["over_tolerance_count"], 1)  # diff 3 > 2
+
+
+# --------------------------------------------------------------------------- #
+# 网页与 API
+# --------------------------------------------------------------------------- #
+
+
+class TestWebUI(VoltTestBase):
+    def _seed(self):
+        rows = [
+            ("B1", "D1", 1, 100), ("B1", "D1", 2, 100),
+            ("B1", "D2", 1, 110), ("B1", "D2", 2, 100),
+            ("B1", "D3", 9, 5),
         ]
         self.upload(rows)
-        # 表单发布 + 表单核查
+        self.publish("B1")
+
+    def test_pages_render(self):
+        self.assertEqual(self.client.get("/").status_code, 200)
+        self.assertEqual(self.client.get("/compare").status_code, 200)
+        self._seed()
+        page = self.client.get("/compare").get_data(as_text=True)
+        self.assertIn("B1", page)
+        # 下拉数据 JSON 中包含三台仪器
+        self.assertIn("D1", page)
+        self.assertIn("D3", page)
+
+    def test_form_publish_and_compare(self):
+        self.upload([
+            ("B1", "D1", 1, 100),
+            ("B1", "D2", 1, 108),
+        ])
         resp = self.client.post("/publish", data={"batch_name": "B1"})
         self.assertEqual(resp.status_code, 302)
-        resp = self.client.post(
-            "/checks/new",
-            data={"baseline_batch": "B1", "target_batch": "B1",
-                  "mad_multiplier": "3"},
+        resp = self.client.get(
+            "/compare",
+            query_string={
+                "batch_name": "B1", "version": 1,
+                "device_x": "D1", "device_y": "D2", "tolerance": 5,
+            },
         )
-        self.assertEqual(resp.status_code, 302)
-        check_id = self.client.get("/api/checks").get_json()["checks"][0]["id"]
+        self.assertEqual(resp.status_code, 200)
+        text = resp.get_data(as_text=True)
+        self.assertIn("共测样品数", text)
+        self.assertIn("1", text)  # 共测 1，超差 1
+
+    def test_devices_api(self):
+        self._seed()
+        resp = self.client.get("/api/batches/B1/versions/1/devices")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["devices"], ["D1", "D2", "D3"])
+        # 不存在的版号 404
         self.assertEqual(
-            self.client.get(f"/checks/{check_id}").status_code, 200
+            self.client.get("/api/batches/B1/versions/9/devices").status_code,
+            404,
         )
-        resp = self.client.post(f"/checks/{check_id}/rerun")
-        self.assertEqual(resp.status_code, 302)
+
+    def test_pair_stats_api(self):
+        self._seed()
+        resp = self.client.get("/api/batches/B1/versions/1/pair-stats")
+        self.assertEqual(resp.status_code, 200)
+        stats = resp.get_json()["pair_stats"]
+        # 3 台仪器 → 3 对
+        self.assertEqual(len(stats), 3)
+        d1d2 = next(
+            s for s in stats if s["device_a"] == "D1" and s["device_b"] == "D2"
+        )
+        self.assertEqual(d1d2["common_count"], 2)
+        self.assertEqual(d1d2["max_abs_diff"], 10)
+        self.assertEqual(d1d2["max_diff_seq"], 1)
+        d1d3 = next(
+            s for s in stats
+            if s["device_a"] == "D1" and s["device_b"] == "D3"
+        )
+        self.assertEqual(d1d3["common_count"], 0)
+        self.assertIsNone(d1d3["max_diff_seq"])
 
 
 if __name__ == "__main__":

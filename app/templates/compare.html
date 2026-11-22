@@ -1,0 +1,124 @@
+{% extends "base.html" %}
+{% block title %}仪器比对{% endblock %}
+{% block body %}
+<p><a href="{{ url_for('main.index') }}">← 返回首页</a></p>
+
+<div class="card">
+  <h2>选择已发布批次与仪器对</h2>
+  {% if devices_map %}
+  <form method="get" action="{{ url_for('main.compare_page') }}">
+    <p>
+      <label>批次
+        <select name="batch_name" id="batch-select" required>
+          <option value="">— 请选择 —</option>
+          {% for batch_name, versions in devices_map.items() %}
+          <option value="{{ batch_name }}"
+            {{ 'selected' if form.batch_name == batch_name }}>
+            {{ batch_name }}
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>版号
+        <select name="version" id="version-select" required>
+          <option value="">— 先选批次 —</option>
+        </select>
+      </label>
+    </p>
+    <p>
+      <label>仪器 1
+        <select name="device_x" id="device-x" required></select>
+      </label>
+      <label>仪器 2
+        <select name="device_y" id="device-y" required></select>
+      </label>
+    </p>
+    <p>
+      <label>容差（非负整数微伏）
+        <input type="number" name="tolerance" min="0" step="1" required
+               value="{{ form.tolerance or '0' }}">
+      </label>
+      <button type="submit">查询比对结果</button>
+    </p>
+  </form>
+
+  <script id="devices-data" type="application/json">{{ devices_map | tojson }}</script>
+  <script>
+    // 已发布版本 -> 仪器列表的数据随页面下发，下拉联动无需再请求后端。
+    const DATA = JSON.parse(document.getElementById("devices-data").textContent);
+    const batchSel = document.getElementById("batch-select");
+    const versionSel = document.getElementById("version-select");
+    const devX = document.getElementById("device-x");
+    const devY = document.getElementById("device-y");
+    const initialVersion = {{ (form.version | tojson) if form.version else 'null' }};
+    const initialX = {{ (form.device_x | tojson) if form.device_x else 'null' }};
+    const initialY = {{ (form.device_y | tojson) if form.device_y else 'null' }};
+
+    function fillDevices(devices, selected) {
+      devX.innerHTML = "";
+      devY.innerHTML = "";
+      devices.forEach((d) => {
+        devX.add(new Option(d, d));
+        devY.add(new Option(d, d));
+      });
+      if (devices.length >= 2) {
+        devY.selectedIndex = 1;  // 默认选两台不同仪器
+      }
+      if (selected && devices.includes(selected)) devX.value = selected;
+      if (initialY && devices.includes(initialY)) devY.value = initialY;
+    }
+
+    function refresh() {
+      const versions = DATA[batchSel.value] || [];
+      versionSel.innerHTML = "";
+      versionSel.add(new Option("— 请选择 —", ""));
+      versions.forEach((v) =>
+        versionSel.add(new Option("v" + v.version, v.version))
+      );
+      if (initialVersion && versions.some((v) => v.version === Number(initialVersion))) {
+        versionSel.value = String(initialVersion);
+      }
+      const cur = versions.find((v) => v.version === Number(versionSel.value));
+      fillDevices(cur ? cur.devices : [], initialX);
+    }
+
+    batchSel.addEventListener("change", refresh);
+    versionSel.addEventListener("change", () => {
+      const versions = DATA[batchSel.value] || [];
+      const cur = versions.find((v) => v.version === Number(versionSel.value));
+      fillDevices(cur ? cur.devices : [], null);
+    });
+    if (batchSel.value) refresh();
+  </script>
+  {% else %}
+  <p class="warn">还没有已发布的批次版本，请先在首页上传并发布。</p>
+  {% endif %}
+</div>
+
+{% if result %}
+<div class="card">
+  <h2>比对结果：{{ result.device_a }} ↔ {{ result.device_b }}</h2>
+  <p class="muted">
+    批次 {{ result.batch_name }} <strong>v{{ result.version }}</strong>，
+    容差 {{ result.tolerance_uv }} 微伏
+  </p>
+  {% if not result.has_common %}
+  <p class="warn">{{ result.message }}</p>
+  {% else %}
+  <table>
+    <tr><th>共测样品数</th><td class="big">{{ result.common_count }}</td></tr>
+    <tr><th>绝对差超过容差的样品数</th>
+        <td class="big {{ 'warn' if result.over_tolerance_count else '' }}">
+          {{ result.over_tolerance_count }}</td></tr>
+    <tr><th>最大绝对差（微伏）</th><td>{{ result.max_abs_diff }}</td></tr>
+    <tr><th>相差最大的样本序号</th>
+        <td>{{ result.max_diff_seq if result.max_diff_seq is not none else '—' }}</td></tr>
+  </table>
+  <p class="muted">
+    提示：仪器顺序不影响结果（已按编号规范化）。修改容差后重新查询，
+    后端仅聚合发布时固化的差值直方图索引。
+  </p>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}
