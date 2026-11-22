@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}异常段查询{% endblock %}
+{% block body %}
+<div class="card">
+  <h2>异常段查询</h2>
+  <form method="get">
+    <input type="text" name="device_id" placeholder="设备编号"
+           value="{{ filters.device_id }}">
+    <input type="text" name="batch_name" placeholder="批次名（基线或待检）"
+           value="{{ filters.batch_name }}">
+    <select name="direction">
+      <option value="">全部方向</option>
+      <option value="high" {{ 'selected' if filters.direction == 'high' }}>偏高</option>
+      <option value="low" {{ 'selected' if filters.direction == 'low' }}>偏低</option>
+    </select>
+    <input type="number" name="min_samples" placeholder="最小样本数" min="1"
+           value="{{ filters.min_samples }}">
+    <button type="submit">查询</button>
+  </form>
+</div>
+
+<div class="card">
+  <table>
+    <tr><th>核查#</th><th>设备</th><th>段#</th><th>序号范围</th>
+        <th>UTC 范围</th><th>样本数</th><th>最大偏离</th><th>方向</th>
+        <th>基线（版号）</th><th>待检（版号）</th><th>MAD×</th></tr>
+    {% for s in segments %}
+    <tr>
+      <td><a href="{{ url_for('main.check_detail', check_id=s.check_id) }}">#{{ s.check_id }}</a></td>
+      <td>{{ s.device_id }}</td>
+      <td>{{ s.seg_index }}</td>
+      <td>{{ s.start_seq }}–{{ s.end_seq }}</td>
+      <td>{{ s.start_utc }} → {{ s.end_utc }}</td>
+      <td>{{ s.sample_count }}</td>
+      <td class="{{ s.direction }}">{{ '%+.4f'|format(s.max_deviation) }}</td>
+      <td class="{{ s.direction }}">{{ '偏高' if s.direction == 'high' else '偏低' }}</td>
+      <td>{{ s.baseline_batch }} v{{ s.baseline_version }}</td>
+      <td>{{ s.target_batch }} v{{ s.target_version }}</td>
+      <td>{{ s.mad_multiplier }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="11" class="muted">没有匹配的异常段</td></tr>
+    {% endfor %}
+  </table>
+  <p class="muted">共 {{ segments|length }} 条</p>
+</div>
+{% endblock %}

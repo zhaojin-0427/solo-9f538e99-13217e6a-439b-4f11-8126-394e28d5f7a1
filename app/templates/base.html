@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}批次漂移核查{% endblock %}</title>
+  <style>
+    :root { --bd:#d0d7de; --bg:#f6f8fa; --ok:#1a7f37; --err:#cf222e; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Segoe UI", "Noto Sans SC", sans-serif;
+           margin: 0; color: #1f2328; }
+    header { background: #24292f; color: #fff; padding: 12px 24px; }
+    header a { color: #fff; margin-right: 18px; text-decoration: none; }
+    main { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+    h2 { border-bottom: 1px solid var(--bd); padding-bottom: 6px; }
+    .card { border: 1px solid var(--bd); border-radius: 8px;
+            padding: 16px; margin-bottom: 22px; background: #fff; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { border: 1px solid var(--bd); padding: 6px 10px; text-align: left; }
+    th { background: var(--bg); }
+    input, select, button { font: inherit; padding: 6px 10px; margin: 4px 0; }
+    button, .btn { background: #1f6feb; color: #fff; border: 0; border-radius: 6px;
+            padding: 7px 14px; cursor: pointer; text-decoration: none; display:inline-block; }
+    button.secondary { background: #57606a; }
+    .flash { padding: 10px 14px; border-radius: 6px; margin-bottom: 14px; }
+    .flash.success { background: #dafbe1; color: var(--ok); }
+    .flash.error { background: #ffebe9; color: var(--err); }
+    .tag { padding: 2px 8px; border-radius: 999px; font-size: 12px; }
+    .tag.published { background: #dafbe1; color: var(--ok); }
+    .tag.draft { background: #fff8c5; color: #9a6700; }
+    .muted { color: #656d76; font-size: 13px; }
+    .high { color: var(--err); } .low { color: #9a6700; }
+    code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+<header>
+  <strong>实验室批次漂移核查</strong>
+  <a href="{{ url_for('main.index') }}">批次与核查</a>
+  <a href="{{ url_for('main.segments_page') }}">异常段查询</a>
+</header>
+<main>
+  {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in messages %}
+      <div class="flash {{ category }}">{{ msg }}</div>
+    {% endfor %}
+  {% endwith %}
+  {% block body %}{% endblock %}
+</main>
+</body>
+</html>

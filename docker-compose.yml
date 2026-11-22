@@ -1,0 +1,21 @@
+services:
+  drift-web:
+    build: .
+    image: lab-drift-check:latest
+    container_name: lab-drift-check
+    ports:
+      - "8000:8000"
+    volumes:
+      - drift-data:/data
+    environment:
+      SECRET_KEY: change-me-in-production
+      DRIFT_DB_PATH: /data/drift.db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  drift-data:

@@ -1,0 +1,105 @@
+{% extends "base.html" %}
+{% block body %}
+
+<div class="card">
+  <h2>1. 上传测量 CSV</h2>
+  <p class="muted">
+    必需列：<code>batch / device / sample_seq / utc_ts / metric_value</code>
+    （支持中文列名 批次/设备/样本序号/UTC时刻/指标值）。同批次同设备同样本序号
+    异值将整份拒绝；完全重复行自动去重。更正数据请重新上传，会生成新版本。
+  </p>
+  <form method="post" action="{{ url_for('main.upload') }}" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".csv,text/csv" required>
+    <input type="text" name="note" placeholder="备注（可选）" size="24">
+    <label class="muted"><input type="checkbox" name="simulate_fail" value="1">
+      模拟写入失败（自测回滚）</label><br>
+    <button type="submit">上传（生成草稿版本）</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>2. 发布批次版本</h2>
+  <p class="muted">仅草稿可发布；已发布版本不可变。核查只能选择已发布版本。</p>
+  <form method="post" action="{{ url_for('main.publish') }}">
+    <input type="text" name="batch_name" placeholder="批次名" required>
+    <input type="number" name="version" placeholder="版本号（留空=最新）" min="1">
+    <button type="submit">发布</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>3. 批次版本</h2>
+  <table>
+    <tr><th>批次</th><th>版本</th><th>状态</th><th>行数</th><th>内容哈希</th>
+        <th>创建时间 (UTC)</th><th>发布时间 (UTC)</th><th>备注</th></tr>
+    {% for b in batches %}
+    <tr>
+      <td>{{ b.batch_name }}</td>
+      <td>v{{ b.version }}</td>
+      <td><span class="tag {{ b.status }}">
+        {{ '已发布' if b.status == 'published' else '草稿' }}</span></td>
+      <td>{{ b.row_count }}</td>
+      <td><code>{{ b.content_hash[:10] }}…</code></td>
+      <td>{{ b.created_at }}</td>
+      <td>{{ b.published_at or '—' }}</td>
+      <td>{{ b.note or '' }}</td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="muted">暂无数据</td></tr>
+    {% endfor %}
+  </table>
+</div>
+
+<div class="card">
+  <h2>4. 创建漂移核查</h2>
+  <form method="post" action="{{ url_for('main.create_check') }}">
+    <label>基线批次
+      <select name="baseline_batch" required>
+        {% for b in batches if b.status == 'published' %}
+        <option value="{{ b.batch_name }}">{{ b.batch_name }} v{{ b.version }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>待检批次
+      <select name="target_batch" required>
+        {% for b in batches if b.status == 'published' %}
+        <option value="{{ b.batch_name }}">{{ b.batch_name }} v{{ b.version }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>MAD 倍数阈值
+      <input type="number" name="mad_multiplier" value="3" min="0.0001"
+             step="0.1" required>
+    </label>
+    <button type="submit">计算并保存核查</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>5. 历史核查（含所用版号，旧结论永久可查）</h2>
+  <table>
+    <tr><th>#</th><th>基线</th><th>待检</th><th>MAD×</th><th>异常段数</th>
+        <th>替代</th><th>创建时间 (UTC)</th><th>操作</th></tr>
+    {% for c in checks %}
+    <tr>
+      <td>{{ c.id }}</td>
+      <td>{{ c.baseline_batch }} v{{ c.baseline_version }}</td>
+      <td>{{ c.target_batch }} v{{ c.target_version }}</td>
+      <td>{{ c.mad_multiplier }}</td>
+      <td>{{ c.total_segments }}</td>
+      <td>{{ ('#' ~ c.supersedes) if c.supersedes else '—' }}</td>
+      <td>{{ c.created_at }}</td>
+      <td>
+        <a class="btn" href="{{ url_for('main.check_detail', check_id=c.id) }}">查看</a>
+        <form method="post" style="display:inline"
+              action="{{ url_for('main.rerun', check_id=c.id) }}">
+          <button class="secondary" type="submit">用最新发布版重算</button>
+        </form>
+      </td>
+    </tr>
+    {% else %}
+    <tr><td colspan="8" class="muted">暂无核查</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endblock %}
